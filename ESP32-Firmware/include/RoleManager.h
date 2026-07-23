@@ -1,7 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include "Heartbeat.h"
-#include "RelayControl.h"
+// #include "RelayControl.h"
 
 enum class RoleState{
     PRIMARY_ACTIVE,
@@ -12,7 +12,7 @@ enum class RoleState{
 
 class RoleManager{
 public:
-    RoleManager(Heartbeat& hb, RelayControl& relays, char myId);
+    RoleManager(Heartbeat& hb, char myId);
 
     void begin();
     void tick();
@@ -21,7 +21,6 @@ public:
 
 private:
     Heartbeat& _hb;
-    RelayControl& _relays;
     char _myId;
 
     RoleState _state = RoleState::STANDBY_PASSIVE;

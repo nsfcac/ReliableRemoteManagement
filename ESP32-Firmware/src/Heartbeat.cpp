@@ -17,15 +17,14 @@ uint8_t Heartbeat::crc8(const uint8_t* data, size_t n) const {
     return crc;
 }
 
-void Heartbeat::send(char myId, uint32_t /*nowMs*/){
+void Heartbeat::send(uint32_t /*nowMs*/){
     static uint8_t seq = 0;
 
-    uint8_t pkt[5];
+    uint8_t pkt[4];
     pkt[0] = 0xAA;
     pkt[1] = 0x55;
-    pkt[2] = (uint8_t)myId;
-    pkt[3] = seq++;
-    pkt[4] = crc8(&pkt[2], 2);
+    pkt[2] = seq++;
+    pkt[3] = crc8(&pkt[2], 2);
 
     _ser.write(pkt, sizeof(pkt));
 

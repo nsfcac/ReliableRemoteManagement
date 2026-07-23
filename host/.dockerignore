@@ -1,0 +1,64 @@
+.git
+.gitignore
+.hg
+.svn
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# --- Dependency Directories ---
+# Exclude local packages; let Docker download them inside the container
+node_modules/
+bower_components/
+venv/
+.venv/
+env/
+ENV/
+lib/
+lib64/
+
+# --- Build Outputs & Cache ---
+dist/
+build/
+out/
+.next/
+.cache/
+*.class
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+
+# --- Testing & Coverage ---
+coverage/
+.nyc_output/
+.pytest_cache/
+htmlcov/
+*.lcov
+
+# --- Logs & Temporary Files ---
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.tmp/
+tmp/
+
+# --- Environment & Sensitive Secrets ---
+# Crucial for security to prevent embedding private keys or environment variables
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.secret
+
+# --- Docker Files ---
+# Optional: Prevent copying the build blueprints into the image itself
+Dockerfile
+docker-compose.yml
+.dockerignore

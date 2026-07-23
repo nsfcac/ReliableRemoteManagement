@@ -7,7 +7,7 @@ public:
 
     void begin(int rxPin, int txPin, uint32_t baund);
     void tick();
-    void send(char myId, uint32_t nowMs);
+    void send(uint32_t nowMs);
 
     bool peerAlive(uint32_t nowMs, uint32_t timeoutMs) const;
     uint32_t lastRxMS() const {return _lastRxMs;}

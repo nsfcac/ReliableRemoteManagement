@@ -54,8 +54,28 @@ bool TemperatureBus::scanBuses(){
     auto* dtI = static_cast<DallasTemperature*>(_dtIntake);
     auto* dtE = static_cast<DallasTemperature*>(_dtExhaust);
 
+    const uint8_t previousIntakeCount = _intakeDeviceCount;
+    const uint8_t previousExhaustCount = _exhaustDeviceCount;
+
+    // DallasTemperature caches device counts. Re-run begin() so sensors added
+    // after boot are discovered during the periodic scan in tick().
+    dtI->begin();
+    dtE->begin();
+
     _intakeDeviceCount = dtI->getDeviceCount();
     _exhaustDeviceCount = dtE->getDeviceCount();
+
+    if (_intakeDeviceCount != previousIntakeCount ||
+        _exhaustDeviceCount != previousExhaustCount) {
+        Serial.printf("[TEMP:scan] intakeN=%u exhaustN=%u\n",
+                      _intakeDeviceCount,
+                      _exhaustDeviceCount);
+    }
+
+    if(_intakeDeviceCount == 0 && _exhaustDeviceCount == 0){
+        Serial.printf("[SENSOR BUS] NO device detected on both busses!\n");
+        return false;
+    }
 
     // If one side has 0 on early bring-up that's ok, but "ready()" will remain false
     // until we successfully read something on each bus.
@@ -118,6 +138,7 @@ void TemperatureBus::readTemperatures(){
             tE = dtE->getTempCByIndex(i);
             if(tE <= -120.0f) tE = NAN;
         }
+        
 
         _intakeC[i]  = tI;
         _exhaustC[i] = tE;

@@ -1,0 +1,1 @@
+# topic strings/builders (mirrors contract §3)
