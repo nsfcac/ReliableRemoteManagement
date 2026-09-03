@@ -1,349 +1,174 @@
-# Reliable Remote Management of REPACSS Cluster (Telemetry v0.1.0)
+# Reliable Remote Management of the REPACSS Cluster
 
-This project implements a **rack-level telemetry subsystem** using **two ESP32 controllers per rack**:
-- **Controller A (Primary)**: sends telemetry during normal operation
-- **Controller B (Standby)**: monitors A via heartbeat and **takes over telemetry sending** if A fails
+Rack-level environmental telemetry and remote firmware management for the REPACSS
+datacenter. Each rack runs **two ESP32 controllers** that read intake/exhaust
+temperatures and publish them over **wired Ethernet (W5500) using MQTT** to a
+Radxa host, which provisions the devices, ingests telemetry into a time-series
+database, and can update firmware over the air.
 
-Telemetry is delivered to the Radxa cluster over **wired Ethernet (W5500)** as a **UDP JSON payload**.
-
----
-
-## Requirements: Heartbeat
-
-### Purpose
-The heartbeat mechanism ensures fault tolerance by continuously monitoring the health of Controller A and enabling Controller B to take over telemetry transmission when A is no longer healthy.
-
-### Requirements
-- Controller A shall transmit a heartbeat signal at a fixed interval of **500 ms**.
-- Controller B shall continuously monitor the heartbeat signal from Controller A.
-- A heartbeat failure shall be declared when **no heartbeat is received within 2000 ms**.
-- Upon detecting heartbeat failure, Controller B shall assume responsibility for telemetry transmission without manual intervention.
-- Heartbeat failure and failover state shall be reported as part of the telemetry payload.
+> **If you worked from an older version of this doc:** the design has changed.
+> Transport is **MQTT, not UDP**. There are **no SPDT switches, relays, or
+> sensor-bus switching** (removed in #26) and **no Wi-Fi failover**. Controllers
+> are now **Primary/Standby** (not "A/B"), run **one unified firmware image**,
+> and are given their identity **by the host**. See "Changed from the original
+> design" at the bottom.
 
 ---
 
-## Requirements: Network Communication
+## Architecture at a glance
 
-### Purpose
-This version of the project uses **Ethernet only** for deterministic, reliable telemetry transport.
+```
+  ESP32 Primary ─┐                      Radxa host                 DB host
+         |       │  W5500 Ethernet   ┌──────────────────┐      ┌──────────────┐
+Heartbeat|       ├── MQTT (1883) ───►│ Mosquitto broker │      │ TimescaleDB  │
+  ESP32 Standby ─┘   HTTP (8080)     │ provisioning svc │─────►│ (PostgreSQL  │
+        │                            │ ingestion svc    │      │  17 + TS ext)│
+        └──────────────-─────────────│ fw-server (nginx)│      └──────────────┘
+                                     └──────────────────┘
+```
 
-### Requirements
-- The system shall use a **W5500 Ethernet module** for network communication.
-- Telemetry shall be transmitted to the Radxa cluster using **UDP**.
-- All ESP32 devices shall transmit to a **single Radxa IP address**.
-- Each telemetry message shall include a unique device identifier (**MAC address**).
-
----
-
-## Requirements: Telemetry Payload
-
-### Purpose
-The telemetry payload provides a single structured message that Radxa can ingest and store.
-
-### Requirements
-Each telemetry message shall include:
-- `message_type` set to `"telemetry"`
-- `device.mac`
-- `timestamp_device_ms`
-- `items[]` containing heartbeat, sensors, and failover event data
+- **Two controllers per rack, Primary + Standby.** Only the active controller
+  publishes telemetry. They watch each other over a UART **heartbeat**; if the
+  Primary goes silent (no beat for 2000 ms) the Standby takes over. Failover is
+  edge-triggered and reported as an MQTT event.
+- **Unified firmware.** Both controllers flash the same binary. Role
+  (Primary/Standby), rack, and enable state come from the host at runtime, so
+  scaling the fleet needs **no firmware changes**, only database rows.
+- **Host services** (Python) run in Docker: provisioning (assigns identity),
+  ingestion (stores telemetry + events), and fw-server (serves OTA binaries).
 
 ---
 
-## Failover Telemetry Rule (Critical)
+## Repository layout
 
-### Requirements
-- Controller A shall transmit telemetry while it is operational.
-- Controller B shall not transmit telemetry while Controller A is healthy.
-- Controller B shall begin transmitting telemetry only after Controller A failure.
-- Controller B shall stop transmitting when Controller A recovers.
+| Path | What's in it |
+|---|---|
+| `ESP32-Firmware/` | PlatformIO firmware (unified image). Key modules: `TelemetrySender` (Ethernet+MQTT), `Heartbeat`, `TemperatureBus`, `RuntimeConfig`, `OtaUpdater`. |
+| `host/app/` | Services: `provisioning_service.py`, `ingestion_service.py`, shared `config.py` / `db.py` / `device_registry.py`. |
+| `host/tests/` | pytest suite for the host services (DB + MQTT mocked). |
+| `db/` | `init.sql` (schema) and `compose.yaml` (TimescaleDB). |
+| `host/fw-server/` | nginx container that serves firmware `.bin` files for OTA. |
+| `docs/mqtt-contract.md` | **Source of truth** for the MQTT messages. Both firmware and host must obey it. |
 
 ---
 
-## Data Structure
+## How it works
 
-```json
-{
-  "message_type": "telemetry",
-  "device": { "mac": "AA:BB:CC:DD:EE:FF" },
-  "timestamp_device_ms": 0,
-  "items": [
-    { "kind": "heartbeat", "controller_a_alive": true, "controller_b_alive": true },
-    {
-      "kind": "sensors",
-      "buses": [
-        { "bus": "cool", "temperatures_c": [0.0, 0.0, 0.0] },
-        { "bus": "exhaust", "temperatures_c": [0.0, 0.0, 0.0] }
-      ]
-    },
-    { "kind": "event", "type": "failover", "occurred": false, "details": "" }
-  ]
-}
+### Provisioning (hello → config)
+1. A device boots **unconfigured** and publishes `hello` every 10 s to
+   `repacss/devices/<mac>/hello` (with its firmware version).
+2. The provisioning service looks the MAC up in `device_map`.
+3. It replies with a **non-retained** `config` on `repacss/devices/<mac>/config`
+   carrying `rack_id`, `role`, and `enabled`.
+4. The device validates and applies it, then stops helloing. An invalid config
+   is rejected and reported as a `config_rejected` event.
+
+Identity is host-assigned; the device only knows its own MAC. See the
+[MQTT contract](docs/mqtt-contract.md) for exact fields and validation rules.
+
+### Telemetry
+The active controller publishes JSON every **5 s** to
+`repacss/devices/<mac>/telemetry`: a heartbeat item (Primary/Standby liveness)
+and a sensors item (intake + exhaust buses, 3 sensors each). Ingestion writes
+**one row per sensor reading** into the `telemetry` hypertable, resolving
+`rack_id` from the registry. Missing/failed sensors are stored as `NULL`.
+
+### Failover and events
+The Standby watches the Primary's heartbeat and, on the healthy→down edge,
+takes over sending and publishes `primary_down` (and `primary_up` on recovery)
+to `repacss/devices/<mac>/event`. Config rejections publish `config_rejected`.
+Ingestion records these in the `events` hypertable with rack and role filled in
+from the registry.
+
+### OTA (over-the-air firmware update)
+Pull-based: the host serves a `.bin` over HTTP (fw-server) and the device
+fetches it, streaming straight into flash while computing SHA-256. The image is
+committed **only if the hash matches**; a bad download never becomes bootable.
+
+Because the stock Arduino bootloader ships **without**
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`, rollback is done **in software**: a
+freshly flashed image is put on probation in NVS and must reach MQTT within
+60 s (or it reverts to the previous slot). This is proven on hardware
+(Phase 2, #31). The MQTT-driven, fleet-automated phases are planned (#37, #38).
+
+---
+
+## MQTT topics (summary)
+
+All rooted at `repacss`. `<mac>` is uppercase hex, no separators (`ECE3347C07D0`).
+The device generates every topic from its own MAC; the host does not send topic
+strings.
+
+| Topic | Direction | Purpose |
+|---|---|---|
+| `repacss/devices/<mac>/hello` | device → host | announce (unconfigured) |
+| `repacss/devices/<mac>/config` | host → device | assign identity |
+| `repacss/devices/<mac>/telemetry` | device → host | sensor + heartbeat data |
+| `repacss/devices/<mac>/event` | device → host | failover, config_rejected |
+
+Full field-level contract, validation rules, and payload examples:
+[`docs/mqtt-contract.md`](docs/mqtt-contract.md).
+
+---
+
+## Database
+
+PostgreSQL 17 + TimescaleDB, schema `repacss_environment` (see
+[`db/init.sql`](db/init.sql)). Lives on its own host in production.
+
+| Table | Role |
+|---|---|
+| `device_map` | registry: mac → rack_id, role, enabled, retired (source of truth for identity) |
+| `telemetry` | hypertable, one row per sensor reading (ts, mac, rack_id, bus, sensor_index, temperature_celsius) |
+| `events` | hypertable of device events (failover, config_rejected, …) |
+| `current_status` | latest per-device state (alive, last_seen, firmware version) |
+| `alerts` | alert history + rate-limit state |
+| `unknown_devices` | telemetry from unregistered MACs (first/last seen, 24 h count) |
+
+`telemetry` and `events` are **compressed** (after 7 and 30 days). No retention
+policy is set, so raw history is kept; the target is at least **1 year** of
+5-second data, provisioned around **1 TB** of storage. `rack_id` is free-form
+text (rack codenames like `rpg93`).
+
+---
+
+## Running it (local/dev)
+
+- **Database:** `docker compose up -d` in `db/`, then load `init.sql`.
+- **Broker + services:** the `host/` compose stack runs Mosquitto, provisioning,
+  and ingestion. They read connection settings from `.env` via `pydantic-settings`.
+- **fw-server:** `docker compose up -d` in `host/fw-server/` (serves `bin/*.bin`
+  on port 8080).
+- **Firmware:** `pio run` in `ESP32-Firmware/` (env `esp32_a`); version is
+  injected from the git tag by `version.py`.
+
+Watch MQTT traffic:
+```bash
+docker exec -it mosquitto mosquitto_sub -h localhost -t "repacss/#" -v
 ```
 
 ---
 
-## Not in This Version
-- No relay control
-- No SPDT switch control
-- No sensor-bus switching
+## Status & roadmap
 
-
-### Requirements: Sensor Bus Configuration
-Purpose: The sensor bus architecture provides redundant access to environmental sensors by implementing two independent buses (front and back) while ensuring electrical isolation and controlled selection using analog SPDT switches.
-
-- The system shall implement two sensor buses, designated as the front bus and the back bus.
-
-- Both sensor buses shall share the same ESP32 GPIO pins, with bus selection performed through SPDT switches.
-
-- Each sensor bus shall be connected to the ESP32 through a dedicated SPDT switch to ensure electrical isolation.
-
-- Only one sensor bus shall be connected to the ESP32 at any time, preventing bus contention and undefined electrical states.
-
-- SPDT switch control shall be managed by system logic and coordinated with heartbeat and failover mechanisms.
-
-- Upon failover, the active SPDT switch shall select the appropriate sensor bus without requiring firmware pin reconfiguration.
-
-- A failure or short on one sensor bus shall not electrically affect the other bus due to SPDT-based isolation.
-
-- The active sensor bus state shall be observable and reportable for monitoring and diagnostics.
-
-### Requirements: Network Communication
-Purpose: The network communication subsystem ensures reliable data delivery by prioritizing wired Ethernet connectivity while providing automatic wireless failover to maintain system availability during network faults.
-
-- The system shall use Ethernet as the primary communication protocol for all normal data transmission and control traffic.
-
-- The system shall support Wi-Fi as a secondary communication path used only when Ethernet connectivity is unavailable or degraded.
-
-- Ethernet link status shall be continuously monitored to detect loss of connectivity or failure conditions.
-
-- Upon detection of an Ethernet failure, the system shall automatically switch communication to Wi-Fi without requiring manual intervention.
-
-- Failover from Ethernet to Wi-Fi shall occur within a bounded and predictable time window to minimize data loss.
-
-- When Ethernet connectivity is restored and verified as stable, the system shall transition back to Ethernet as the primary communication channel.
-
-- Network failover events shall be logged and reported to the monitoring or alerting system for diagnostics and maintenance awareness.
-
-- The failover mechanism shall operate independently of the heartbeat and relay logic but remain coordinated to preserve overall system consistency.
-
-### Requirements: Rack Identification
-Purpose: Rack identity shall be assigned and managed centrally by the Radxa cluster to support scalable deployment without requiring firmware changes. The system shall also detect and safely handle telemetry received from unregistered (unknown) ESP32 devices.
-
-- The ESP32 firmware shall transmit telemetry containing a unique device identifier (e.g., MAC address) with every message.
-
-- The Radxa cluster shall maintain a configuration mapping of MAC address → rack_id (and optionally role, location, and metadata).
-
-- The Radxa cluster shall be the source of truth for rack identification and labeling.
-
-- Upon receiving telemetry from a MAC address not present in the Radxa mapping, the system shall:
-
-    - Mark the data as unassigned/unknown (e.g., rack_id = "unknown" or unassigned=true).
-
-    - Store the unknown MAC address and associated metadata (first-seen time, last-seen time, message count).
-
-    - Continue ingesting the data without dropping it, while ensuring it is clearly labeled as unassigned.
-
-**Alerting Policy for Unknown MAC Addresses**
-
-- Unknown MAC address detection shall generate a warning severity event (not an error).
-
-- The system shall send a summarized notification to the administrator once every 24 hours if one or more unknown MAC addresses were observed during that period.
-
-- The daily warning notification shall include, at minimum:
-
-    - List of unknown MAC addresses
-
-    - First-seen and last-seen timestamps (per MAC)
-
-    - Count of messages received (per MAC)
-
-    - Any available network/source details (e.g., IP, interface: Ethernet/Wi-Fi)
-
-**Non-Functional Requirement**
-
-- The unknown-device warning mechanism shall be rate-limited to at most one notification per 24-hour window, to prevent alert fatigue while ensuring visibility for maintenance.
+- **Done:** unified firmware + role-based failover (#26), MQTT provisioning +
+  telemetry, host DB pipeline (provisioning, ingestion, events), TimescaleDB
+  schema + compression, **OTA Phase 2** (verified HTTP OTA + software rollback, #31).
+- **Next:** `enabled:false` remote disable (#19), config-MAC verification (#18),
+  **OTA Phase 3** MQTT control plane (#37) and **Phase 4** automated rollout (#38).
+- **Planned:** out-of-band alerting (Prometheus + Alertmanager, #23/#39), commanded
+  rollback for healthy-but-misbehaving images (#32/#33).
 
 ---
 
-# Radxa Cluster -  STILL IN DEVELOPMENT
+## Changed from the original design
 
-## Purpose
-The Radxa cluster shall act as the **central ingestion, identification, storage, and alerting authority** for the rack-level telemetry system. It shall provide scalable rack identification, reliable **long-term storage of environmental telemetry**, operational event tracking, and controlled administrator notifications without requiring firmware changes when the system scales.
-
----
-
-## Requirements: Database
-
-### Purpose
-A centralized SQL database shall be used to persist **environmental telemetry, system configuration, operational state, and alert metadata** required for reliable long-term monitoring and visualization through Grafana.
-
-### Requirements
-- The Radxa cluster shall maintain a **PostgreSQL-based database** for:
-  - **Environmental telemetry storage** (temperature and humidity time-series at 5-second resolution)
-  - **Device-to-rack identity mapping** (MAC → rack_id)
-  - **Device status tracking** (last seen timestamp, last network interface, last known IP when available)
-  - **Unknown device registry** (first seen, last seen, message counts)
-  - **System event history** (failover, relay switching, aisle switching, network failover)
-  - **Alert history and rate-limiting state** (e.g., unknown-device summary once per 24 hours)
-
-- The database shall be the **source of truth** for rack identification and telemetry persistence.
-- The database shall allow updates to rack mappings without requiring firmware modifications.
-- Database write operations shall not block telemetry ingestion; ingestion shall continue in a fail-safe manner if the database is temporarily unavailable.
-- The database shall be compatible with **Grafana SQL data sources** for dashboarding and alerting.
-
-### Recommended Implementation
-- PostgreSQL shall be used as the primary database.
-- Use of **TimescaleDB extensions** is recommended to optimize time-series storage, indexing, compression, and retention management.
-
----
-
-## Requirements: Telemetry Ingestion
-
-- The Radxa cluster shall ingest telemetry messages from ESP32 devices using a **minimal required schema**.
-- Each message shall include a **device identifier (MAC address)** and a **message type**.
-- The Radxa cluster shall timestamp all messages at ingestion time.
-- Telemetry ingestion shall continue even if the sending device is unknown or not mapped to a rack.
-- **Temperature and humidity telemetry shall be persisted to the database as the primary system output.**
-
----
-
-## Requirements: Telemetry Sampling Rate
-
-- Environmental telemetry shall be reported at a fixed interval of **5 seconds** per rack.
-- The database schema and indexing strategy shall support sustained ingestion at this rate without data loss.
-- Long-term retention of telemetry data shall be supported (minimum **1 year**).
-
----
-
-## Requirements: Rack Identification
-
-- The Radxa cluster shall maintain a **MAC → rack_id** mapping in the database.
-- Rack identity shall be resolved and assigned during telemetry ingestion.
-- Telemetry received from unmapped devices shall be labeled as `rack_id = unknown`.
-- Scaling the system shall require **Radxa-side database updates only**.
-
----
-
-## Requirements: Heartbeat Awareness
-
-- The Radxa cluster shall ingest periodic heartbeat messages.
-- Device liveness shall be determined using a **last-seen timestamp**, not by storing every heartbeat as a time-series.
-- Missing heartbeat beyond a configured timeout shall be interpreted as a device failure.
-- Heartbeat failures and failover-related events shall be recorded as system events.
-- Heartbeat failures shall trigger administrator notifications.
-
----
-
-## Requirements: Unknown Device Detection
-
-- The Radxa cluster shall detect telemetry from MAC addresses not present in the MAC → rack_id mapping.
-- Unknown devices shall be labeled as `rack_id = unknown` and marked as unassigned.
-- Unknown device metadata shall be stored in the database, including:
-  - First-seen timestamp
-  - Last-seen timestamp
-  - Message count (rolling 24-hour window)
-  - Network metadata when available (IP address and interface)
-- Unknown-device detection shall generate a **warning-level condition** (not an error).
-- A summarized unknown-device notification shall be sent **at most once every 24 hours**.
-- The 24-hour rate limit shall be enforced using database state.
-
----
-
-## Data Structure (What Radxa Receives)
-
-### Required Telemetry Envelope
-```json
-{
-  "schema_version": "1.0",
-  "message_type": "heartbeat|sensors|event",
-  "device": { "mac": "AA:BB:CC:DD:EE:FF" },
-  "timestamp_device_ms": 0
-}
-```
-
----
-
-### Heartbeat Message
-```json
-{
-  "message_type": "heartbeat",
-  "device": { "mac": "AA:BB:CC:DD:EE:FF" },
-  "heartbeat": { "alive": true },
-  "timestamp_device_ms": 0
-}
-```
-
----
-
-### Sensor Readings Message
-```json
-{
-  "message_type": "sensors",
-  "device": { "mac": "AA:BB:CC:DD:EE:FF" },
-  "sensors": [
-    { "aisle": "cool|exhaust", "temperature_c": 0.0, "humidity_rh": 0.0 }
-  ],
-  "timestamp_device_ms": 0
-}
-```
-
----
-
-### Event Message
-```json
-{
-  "message_type": "event",
-  "device": { "mac": "AA:BB:CC:DD:EE:FF" },
-  "event": {
-    "type": "failover|relay_switch|aisle_switch|network_failover",
-    "value": "string"
-  },
-  "timestamp_device_ms": 0
-}
-```
-
----
-
-## Radxa Database Schema (PostgreSQL)
-
-### device_map
-- mac (PRIMARY KEY)
-- rack_id
-- expected_role
-- notes
-
-### device_status
-- mac (PRIMARY KEY)
-- last_seen_ts
-- last_ip
-- last_interface
-- last_rack_id_resolved
-
-### telemetry_samples
-- ts
-- mac
-- rack_id
-- unassigned
-- aisle
-- temperature_c
-- humidity_rh
-
-### unknown_devices
-- mac (PRIMARY KEY)
-- first_seen_ts
-- last_seen_ts
-- message_count_24h
-
-### events
-- id
-- ts
-- mac
-- rack_id
-- type
-- value
-
----
-
-## Storage Provisioning
-- The system shall provision **around 1 TB of persistent storage** to support multi-year retention of 5-second telemetry data and future system scaling.
-
+| Old (early spec) | Now |
+|---|---|
+| UDP JSON | MQTT (PubSubClient / Mosquitto) |
+| Controller A / B | Primary / Standby, host-assigned role |
+| Per-controller firmware | one unified image |
+| SPDT switches, relays, sensor-bus switching | removed (#26); two fixed buses (intake/exhaust) per esp32|
+| Wi-Fi failover | none; wired Ethernet only (expecting wifi v2.0.0)|
+| Device-chosen identity | host-assigned via `device_map` |
+| Bus names `cool` | `inlet` / `exhaust` |

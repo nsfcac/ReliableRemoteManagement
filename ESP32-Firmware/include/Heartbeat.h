@@ -11,17 +11,14 @@ public:
 
     bool peerAlive(uint32_t nowMs, uint32_t timeoutMs) const;
     uint32_t lastRxMS() const {return _lastRxMs;}
-    char peerId() const {return _peerId;}
 
 private:
     HardwareSerial& _ser;
 
     uint32_t _lastRxMs = 0;
-    char _peerId = '?';
 
     uint8_t _state = 0;
-    uint8_t _buf[2];
-    uint8_t _idx = 0;
+    uint8_t _seq = 0;
 
     void parseByte(uint8_t b);
     uint8_t crc8(const uint8_t* data, size_t n) const;

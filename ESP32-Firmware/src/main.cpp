@@ -4,11 +4,13 @@
 #include "Heartbeat.h"
 #include "TemperatureBus.h"
 #include "TelemetrySender.h"
+#include "OtaUpdater.h"
 
 HardwareSerial HBSerial(HB_UART_NUM);
 Heartbeat hb(HBSerial);
 TemperatureBus tempBus;
 TelemetrySender net;
+OtaUpdater ota;
 
 static inline bool isControllerPrimary() { return net.isConfigured() && net.role() == ControllerRole::Primary; }
 static inline bool isControllerStandby() { return net.isConfigured() && net.role() == ControllerRole::Standby; }
@@ -25,7 +27,7 @@ void heartbeatTask(void *param){
     //Send own heartbeat periodically
     if((uint32_t)(now - lastSend) >= HB_SEND_MS){
       lastSend = now;
-      hb.send(now);
+      if(!OtaUpdater::isUpdating()){hb.send(now);}
     }
 
     vTaskDelay(pdMS_TO_TICKS(5));
@@ -142,6 +144,47 @@ static void buildTelemetryJson(char* out, size_t outSz,
   );
 }
 
+// Phase 2 OTA trigger: the operator types "ota <url> <sha256>" over serial.
+// Non-blocking: drains whatever bytes are available on each loop pass and only
+// acts once a full line has arrived. Phase 3 replaces this with the MQTT ota
+// command; OtaUpdater itself stays trigger-agnostic either way.
+static void pollSerialCommands() {
+  static char line[256];   // static: characters arrive across many loop passes
+  static size_t idx = 0;
+
+  while (Serial.available()) {          // while, not if: drain, but never wait
+    const char c = (char)Serial.read();
+
+    // Treat CR and LF both as end-of-line; monitors differ on what they send.
+    if (c == '\n' || c == '\r') {
+      if (idx == 0) continue;           // blank line, or the LF half of a CRLF
+      line[idx] = '\0';
+      idx = 0;
+
+      char url[128];                    // matches OtaUpdater::_url
+      char sha[65];                     // 64 hex chars + terminator
+      // Field widths are one less than each buffer, so sscanf cannot overrun.
+      // sscanf returns the number of fields assigned, so 2 means both parsed.
+      if (sscanf(line, "ota %127s %64s", url, sha) == 2) {
+        Serial.printf("[CMD] ota url=%s sha=%s\n", url, sha);
+        ota.request(url, sha);
+      } else if (strcmp(line, "help") == 0) {
+        Serial.println("[CMD] usage: ota <http-url> <sha256-hex-64>");
+      } else {
+        Serial.printf("[CMD] unknown command: %s (try 'help')\n", line);
+      }
+      continue;
+    }
+
+    if (idx + 1 >= sizeof(line)) {      // overlong input: drop it and resync
+      Serial.println("[CMD] input too long, discarded");
+      idx = 0;
+      continue;
+    }
+    line[idx++] = c;
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -161,6 +204,7 @@ void setup() {
   if(!netOK){
     Serial.println("[SETUP NET] Ethernet init failed or link is down");
   }
+  ota.begin();
 
   Serial.println("Heartbeat + TemperatureBus started\n");
 
@@ -175,6 +219,9 @@ void loop() {
 
   net.loop();
   net.hello();
+  pollSerialCommands();   // before tick(), so a command typed now runs this pass
+  ota.tick();
+  if(net.isMqttConnected()) ota.confirmHealthy();
 
   // 3) Temperature sampling (tick exactly once per loop)
   tempBus.tick(now);
@@ -270,8 +317,8 @@ void loop() {
     const bool healthy = peerAlive;
 
     if (lastHealthy && !healthy) {
-      Serial.printf("[ALERT: STANDBY] Lost heartbeat from Primary (timeout=%d ms). peer=%c age_ms=%lu\n",
-                    (int)HB_TIMEOUT_MS, hb.peerId(), (unsigned long)ageMs);
+      Serial.printf("[ALERT: STANDBY] Lost heartbeat from Primary (timeout=%d ms). age_ms=%lu\n",
+                    (int)HB_TIMEOUT_MS, (unsigned long)ageMs);
       
         if (net.isUp()){
           const bool sent = net.sendEvent("{\"message_type\":\"event\",\"event_type\":\"primary_down\",\"details\":\"Standby took over after Primary heartbeat timeout\"}");

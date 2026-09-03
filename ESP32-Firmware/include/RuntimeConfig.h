@@ -21,14 +21,14 @@ struct RuntimeConfig{
 
     String lastError;
 
-    bool isValid() const;
+    bool isValid(const String& device_mac) const;
     bool isPrimary() const;
     bool isStandby() const;
 
     const char* roleString() const; //If not used in the future remove it
 };
 
-bool parseRuntimeConfigJson(const String& json, RuntimeConfig& outConfig, String& error);
+bool parseRuntimeConfigJson(const String& json, RuntimeConfig& outConfig, String& error, const String& device_mac);
 
 //Helpers
 ControllerRole parseRole(const String& roleText);

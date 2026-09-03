@@ -28,13 +28,19 @@ All topics are rooted at the base prefix `repacss` (firmware: `BASE_TOPIC`).
 |---|---|---|---|---|
 | `repacss/devices/<mac>/hello`   | device → host | ESP32 | provisioning svc | no |
 | `repacss/devices/<mac>/config`  | host → device | provisioning svc | ESP32 | no |
-| `repacss/racks/<rack_id>/telemetry` | device → host | ESP32 (active controller) | ingestion svc | no |
-| `repacss/racks/<rack_id>/status` | device → host | ESP32 | ingestion svc | *reserved / future* |
-| `repacss/racks/<rack_id>/event`  | device → host | ESP32 | ingestion svc | *reserved / future* |
+| `repacss/devices/<mac>/telemetry` | device → host | ESP32 (active controller) | ingestion svc | no |
+| `repacss/devices/<mac>/event`  | device → host | ESP32 | ingestion svc | no |
+| `repacss/devices/<mac>/status` | device → host | ESP32 | ingestion svc | *reserved / future* |
 
 - `<mac>` — see MAC format in §4.
-- `<rack_id>` — assigned by the host in the config; the **device builds** the
-  telemetry topic from it (host does not send topic strings).
+- **All topics are keyed by `<mac>`, not `<rack_id>`.** The device generates
+  every topic from its own MAC (firmware globals `gHelloTopic`, `gConfigTopic`,
+  `gTelemetryTopic`, `gEventTopic`); the host does not send topic strings. The
+  host resolves rack and role from the MAC via the registry on the receiving
+  side. (`rack_id` is still delivered in the config for the device to report,
+  it just is not part of any topic path.)
+- `event` is **implemented**: failover (`primary_down` / `primary_up`) and
+  `config_rejected`. `status` remains reserved.
 
 > Trade-off:
 > Retained means a rebooting device gets its config immediately on subscribe
@@ -53,7 +59,7 @@ Topic: `repacss/devices/<mac>/config`
 | `mac` | string | yes | target device MAC; device rejects if it ≠ its own |
 | `configured` | bool | yes | device is provisioned (must be `true` to be accepted) |
 | `enabled` | bool | yes | device may transmit; `false` = provisioned but silent (remote off, e.g. OTA) |
-| `rack_id` | string | yes | rack identity; device builds `repacss/racks/<rack_id>/telemetry` from it |
+| `rack_id` | string | yes | rack identity (free-form text, e.g. `rpg93`); reported by the device, not used in topic paths |
 | `role` | string | yes | `"Primary"` or `"Standby"` — drives sender selection (failover) |
 
 **Role vocabulary (exact strings):** `Primary` | `Standby`
@@ -72,8 +78,8 @@ Evaluated on the device; a rejected config is logged and NOT applied.
 - `rack_id` missing or empty → REJECT
 - `role` not in {`Primary`, `Standby`} → REJECT
 - `enabled` — **not** a reject condition. Must be a boolean; `false` means the
-  config is applied but the device stays silent (remote disable). See §10 —
-  current firmware still rejects `enabled: false` and must be changed to match.
+  config is applied but the device stays silent (remote disable). Implemented
+  in #19; before that the firmware rejected it and kept helloing.
 
 **Example — valid config:**
 This doubles as the string you'll `mosquitto_pub` when testing, and the fixture
@@ -103,8 +109,9 @@ Topic: `repacss/devices/<mac>/hello`
 |---|---|---|
 | `message_type` | string | `"hello"` |
 | `mac` | string | announcing device's MAC (same format as §4) |
+| `firmware_version` | string | running image version, from the git tag (e.g. `v0.0.2-19-gef833c6`) |
 
-- **Cadence:** every `HELLO_INTERVAL_MS` (currently 60 s) while unconfigured; stops once configured.
+- **Cadence:** every `HELLO_INTERVAL_MS` (currently 10 s) while unconfigured; stops once configured.
 - **Retained:** no.
 
 **Example:**
@@ -112,7 +119,8 @@ Topic: `repacss/devices/<mac>/hello`
 ```json
 {
   "message_type": "hello",
-  "mac": "AABBCCDDEEFF"
+  "mac": "AABBCCDDEEFF",
+  "firmware_version": "v0.0.2-19-gef833c6"
 }
 ```
 
@@ -120,10 +128,10 @@ Topic: `repacss/devices/<mac>/hello`
 
 ## 6. Telemetry message (device → host)
 
-Topic: `repacss/racks/<rack_id>/telemetry`
+Topic: `repacss/devices/<mac>/telemetry`
 
-- **Identity key is the `mac` in the payload.** The topic carries `rack_id`, but
-  the host resolves rack/role/etc. from the **MAC → registry map** at ingest time.
+- **Identity key is the `mac`** (in both the topic and the payload). The host
+  resolves rack/role/etc. from the **MAC → registry map** at ingest time.
   Telemetry does NOT need to carry `rack_id`/`role`.
 - **Cadence:** 5 s per rack. **Retained:** no.
 - Only the **active** controller publishes (Primary normally; Standby after failover).
@@ -141,8 +149,8 @@ Topic: `repacss/racks/<rack_id>/telemetry`
   "items": [
     {
       "kind": "heartbeat",
-      "controller_a_alive": true,
-      "controller_b_alive": true
+      "primary_alive": true,
+      "standby_alive": true
     },
     {
       "kind": "sensors",
@@ -156,31 +164,52 @@ Topic: `repacss/racks/<rack_id>/telemetry`
           "temperatures_c": [30.10, 30.50, 31.00]
         }
       ]
-    },
-    {
-      "kind": "event",
-      "type": "failover",
-      "occurred": false,
-      "details": ""
     }
   ]
 }
 ```
 
+> The telemetry payload carries only `heartbeat` and `sensors` items. Failover
+> and other events are published separately on `repacss/devices/<mac>/event`
+> (see §6b), not embedded in telemetry.
+
+### 6b. Event message (device → host)
+
+Topic: `repacss/devices/<mac>/event`. Non-retained. Published on a state change,
+not on a cadence.
+
+```json
+{ "message_type": "event", "event_type": "primary_down", "details": "Standby took over after Primary heartbeat timeout" }
+```
+
+| `event_type` | When |
+|---|---|
+| `primary_down` | Standby stops seeing the Primary's heartbeat and takes over |
+| `primary_up` | Primary's heartbeat returns |
+| `config_rejected` | a received config failed validation (`details` = reason) |
+
+The payload carries only `event_type` and `details`; the host fills in `rack_id`
+and `role` from the registry when it writes the `events` row.
+
 ---
 
 ## 7. Identity resolution (host side)
 
-> TODO(you): describe the MAC → (rack_id, role, …) registry that both services
-> rely on. Where it lives now (in-memory dict) and where it's going (Postgres
-> `device_map`). This is the host's source of truth; the config message is just
-> the registry projected onto one device.
+The host is the source of truth for identity. `device_map` (Postgres, table
+`repacss_environment.device_map`) maps **MAC → (rack_id, role, enabled)**. Both
+services resolve identity from the MAC in the topic/payload via a shared,
+cached registry (`app/device_registry.py`, TTL cache with bounded
+refresh-on-miss). The `config` message is just that registry projected onto one
+device. A MAC not in `device_map` is unknown: provisioning records it in
+`unknown_devices` and deliberately sends **no reply**, so the device stays
+unconfigured and keeps helloing. Ingestion drops unknown data (recording it
+there is still open).
 
 ---
 
 ## 8. Ownership summary
 
-> TODO(you): one short table/paragraph. The principle we settled on:
+> TODO: one short table/paragraph. The principle the team settled on:
 >   - **Host owns identity** — the MAC → rack/role mapping.
 >   - **Firmware owns the topic convention** — builds topics from identity.
 > Each config field has exactly one job (mac=addressing, configured/enabled=gates,
@@ -191,7 +220,7 @@ Topic: `repacss/racks/<rack_id>/telemetry`
 
 ## 9. Versioning & change policy
 
-> TODO(you): how schema changes are made. Since firmware + host live in one repo,
+> TODO: how schema changes are made. Since firmware + host live in one repo,
 > a contract change should be a single commit touching both sides + this doc.
 > Note whether you'll add a `config_version` / `schema_version` field later
 > (relates to #13 config_ack).
@@ -200,8 +229,10 @@ Topic: `repacss/racks/<rack_id>/telemetry`
 
 ## 10. Open items
 
+- [x] `event` topic implemented — failover (`primary_down`/`primary_up`) and `config_rejected`
 - [ ] `config_ack` on `repacss/devices/<mac>/ack` — see #13
-- [ ] align `host/example.md` + firmware to this doc — see #11
-- [ ] firmware: implement `cfg.mac == gMacSafe` self-check (not done yet — §4)
-- [ ] firmware: accept `enabled: false` instead of rejecting it, so remote disable works — see #6
+- [ ] align `host/docs/example.md` + firmware to this doc — see #11
+- [x] firmware: config `mac` is checked against the device's own MAC (§4) — #18
+- [x] firmware: `enabled: false` is accepted and applied, so remote disable works — #19
+- [ ] OTA command/status topics (`ota`, `ota/status`) — Phase 3, see #37
 - [ ] firmware: drop `topics{}` parsing, build the telemetry topic locally from `rack_id`

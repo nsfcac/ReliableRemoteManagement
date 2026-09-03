@@ -20,11 +20,14 @@ uint8_t Heartbeat::crc8(const uint8_t* data, size_t n) const {
 void Heartbeat::send(uint32_t /*nowMs*/){
     static uint8_t seq = 0;
 
+    // Frame: AA 55 SEQ CRC, where CRC covers SEQ only. No device ID: the
+    // unified image (#26) has no per-controller identity, "a valid frame
+    // arrived" is the entire signal.
     uint8_t pkt[4];
     pkt[0] = 0xAA;
     pkt[1] = 0x55;
     pkt[2] = seq++;
-    pkt[3] = crc8(&pkt[2], 2);
+    pkt[3] = crc8(&pkt[2], 1);
 
     _ser.write(pkt, sizeof(pkt));
 
@@ -32,7 +35,7 @@ void Heartbeat::send(uint32_t /*nowMs*/){
 
 bool Heartbeat::peerAlive(uint32_t nowMs, uint32_t timeoutMs) const{
     if (_lastRxMs == 0) return false;
-    return (u_int32_t)(nowMs - _lastRxMs) <= timeoutMs;
+    return (uint32_t)(nowMs - _lastRxMs) <= timeoutMs;
 }
 
 void Heartbeat::tick(){
@@ -42,32 +45,20 @@ void Heartbeat::tick(){
 }
 
 void Heartbeat::parseByte(uint8_t b){
-    // Frame: AA 55 ID SEQ CRC
+    // Frame: AA 55 SEQ CRC (must match send() above)
     switch(_state){
         case 0:
-            _state = (b== 0xAA) ? 1 : 0;
+            _state = (b == 0xAA) ? 1 : 0;
             break;
         case 1:
-            if(b == 0x55){
-                _state = 2;
-                _idx = 0;
-            } else {
-                _state = 0;
-            }
+            _state = (b == 0x55) ? 2 : 0;
             break;
         case 2:
-            _buf[_idx++] = b;
+            _seq = b;
             _state = 3;
             break;
-        case 3:
-            _buf[_idx++] = b;
-            _state = 4;
-            break;
-        case 4: {
-            uint8_t got = b;
-            uint8_t calc = crc8(_buf, 2);
-            if (got == calc){
-                _peerId = (char)_buf[0];
+        case 3: {
+            if (b == crc8(&_seq, 1)){
                 _lastRxMs = millis();
             }
             _state = 0;

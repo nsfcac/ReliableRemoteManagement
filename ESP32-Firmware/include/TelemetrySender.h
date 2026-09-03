@@ -9,6 +9,7 @@ class TelemetrySender {
   public:
     bool begin();
     void loop();
+    bool isMqttConnected() const;
     bool isUp() const;
     void setConfig(const RuntimeConfig& cfg);
    

@@ -1,5 +1,13 @@
 #pragma once
 
+/*
+==========
+Firmware Conf
+==========
+*/
+#ifndef FIRMWARE_VERSION
+    #define FIRMWARE_VERSION "0.0.0-local"
+#endif
 
 /*
 ==========

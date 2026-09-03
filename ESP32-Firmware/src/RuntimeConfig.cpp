@@ -2,6 +2,16 @@
 
 #include <ArduinoJson.h>
 
+static String normalizeMac(const String& in){
+    String out;
+    for(size_t i =0; i<in.length(); i++){
+        char c = in[i];
+        if(c == ':' || c == '-') continue;
+        out += (char)toupper(c);
+    }
+    return out;
+}
+
 ControllerRole parseRole(const String& roleText){
     if(roleText == "Primary") return ControllerRole::Primary;
     if(roleText == "Standby") return ControllerRole::Standby;
@@ -42,17 +52,16 @@ const char* RuntimeConfig::roleString() const{
         }
 }
 
-bool RuntimeConfig::isValid() const{
+bool RuntimeConfig::isValid(const String& device_mac) const{
     if(!configured) return false;
-    if(!enabled) return false;
-    if(mac.length() == 0) return false;
+    if(normalizeMac(mac) != normalizeMac(device_mac)) return false;
     if(rackID.length() == 0) return false;
     if(role == ControllerRole::Unknown) return false;
     
     return true;
 }
 
-bool parseRuntimeConfigJson(const String& json, RuntimeConfig& outConfig, String& error){
+bool parseRuntimeConfigJson(const String& json, RuntimeConfig& outConfig, String& error, const String& device_mac){
     StaticJsonDocument<2048> doc;
 
     DeserializationError parseError = deserializeJson(doc, json);
@@ -85,13 +94,13 @@ bool parseRuntimeConfigJson(const String& json, RuntimeConfig& outConfig, String
     cfg.statusTopic = String((const char*)(topics["status"] | ""));
     cfg.eventTopic = String((const char*)(topics["event"] | ""));
 
-    if(!cfg.isValid()){
+    if(!cfg.isValid(device_mac)){
         error = "config failed validation step";
 
         if(!cfg.configured){
             error = "Device is not configured";
-        }else if(!cfg.enabled){
-            error = "Device is not enabled";
+        }else if(normalizeMac(cfg.mac) != normalizeMac(device_mac)){
+            error = "MAC does not match with this device";
         }else if(cfg.rackID.length() == 0){
             error = "No rack id";
         }else if(cfg.role == ControllerRole::Unknown){

@@ -5,8 +5,12 @@
 .vscode/ipch
 .vscode/
 .DS_Store
+.env
 example.md
 
 host/broker/data/
 host/broker/log/
+host/fw-server/bin/
 venv/
+__pycache__/
+.pytest_cache/
